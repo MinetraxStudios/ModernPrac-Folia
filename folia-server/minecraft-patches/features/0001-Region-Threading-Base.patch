@@ -14579,12 +14579,14 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
 +        // Folia start - fix region ownership race in placeInAsync
 +        // Region topology may change between task queuing and execution (splits/merges),
 +        // causing the task to drain on a region that no longer owns the destination chunk.
-+        // The thread check inside addEntity uses getRegionAtUnsynchronised which can see
-+        // stale region mappings during concurrent splits. We use getRegionAtSynchronised
-+        // (which acquires the regioniser read lock) to get a consistent view, and re-queue
-+        // if the current region doesn't own the destination chunk.
-+        final int destChunkX = posChunk.x;
-+        final int destChunkZ = posChunk.z;
++        // The thread check inside addEntity (moonrise's ServerEntityLookup.checkThread) uses
++        // the entity's LIVE chunk position via getRegionAtUnsynchronised, which can differ from
++        // the chunk coordinates captured at placeInAsync time if:
++        //   1. A concurrent region split/merge changes the topology between our check and addEntity
++        //   2. The entity's position was modified between placeInAsync and task execution
++        //   3. The task was routed to the wrong region's queue due to a stale unsynchronised read
++        // We use the entity's live chunk position (matching what addEntity will check) and verify
++        // ownership with getRegionAtSynchronised. If ownership fails, we re-queue to the correct chunk.
 +        final int[] requeueCount = new int[]{0};
 +        final Runnable[] entityJoinTask = new Runnable[1];
 +
@@ -14594,22 +14596,54 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
 +                return;
 +            }
 +
-+            // verify the executing region owns the destination chunk using a synchronized
-+            // lookup to avoid stale reads from getRegionAtUnsynchronised during concurrent splits
++            // Use the entity's LIVE chunk position - this is exactly what moonrise's
++            // ServerEntityLookup.checkThread / TickThread.ensureTickThread will check.
++            // We must verify ownership of THIS position, not the position captured at queue time,
++            // because they can diverge due to race conditions or entity state changes.
++            final ChunkPos liveChunkPos = Entity.this.chunkPosition();
++            final int liveChunkX = liveChunkPos.x;
++            final int liveChunkZ = liveChunkPos.z;
++
++            // Also verify all passengers' chunk positions - placeSingleSync is called for each
++            // entity in the tree, and addEntity checks each entity's own chunk position
++            boolean allOwnedByCurrentRegion = true;
 +            final io.papermc.paper.threadedregions.ThreadedRegionizer.ThreadedRegion<io.papermc.paper.threadedregions.TickRegions.TickRegionData, io.papermc.paper.threadedregions.TickRegions.TickRegionSectionData>
 +                currentRegion = io.papermc.paper.threadedregions.TickRegionScheduler.getCurrentRegion();
-+            if (currentRegion != null && destination.regioniser.getRegionAtSynchronised(destChunkX, destChunkZ) != currentRegion) {
++
++            if (currentRegion != null) {
++                // Check root entity
++                if (destination.regioniser.getRegionAtSynchronised(liveChunkX, liveChunkZ) != currentRegion) {
++                    allOwnedByCurrentRegion = false;
++                }
++
++                // Check all entities in the passenger tree
++                if (allOwnedByCurrentRegion) {
++                    for (EntityTreeNode node : passengerTree.getFullTree()) {
++                        final ChunkPos nodeChunkPos = node.root.chunkPosition();
++                        if (destination.regioniser.getRegionAtSynchronised(nodeChunkPos.x, nodeChunkPos.z) != currentRegion) {
++                            allOwnedByCurrentRegion = false;
++                            break;
++                        }
++                    }
++                }
++            }
++
++            if (currentRegion != null && !allOwnedByCurrentRegion) {
 +                if (++requeueCount[0] > 16) {
 +                    throw new IllegalStateException(
-+                        "Cannot place entity at chunk [" + destChunkX + ", " + destChunkZ
++                        "Cannot place entity at chunk [" + liveChunkX + ", " + liveChunkZ
 +                        + "] in world '" + destination.getWorld().getKey()
 +                        + "' after 16 attempts - region ownership unstable"
++                        + " (entity pos: " + Entity.this.position()
++                        + ", region center: " + currentRegion.getCenterChunk() + ")"
 +                    );
 +                }
 +                // re-push so the next attempt's removePendingTeleport succeeds
 +                destination.pushPendingTeleport(pendingTeleport);
++                // Re-queue using the entity's LIVE chunk position so the task is routed
++                // to the region that actually owns the entity's destination
 +                io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue.queueTickTaskQueue(
-+                    destination, destChunkX, destChunkZ, entityJoinTask[0]
++                    destination, liveChunkX, liveChunkZ, entityJoinTask[0]
 +                );
 +                return;
 +            }
@@ -14638,6 +14672,10 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
 +            }
 +        };
 +
++        // Use the captured posChunk for initial task routing - this is correct at queue time.
++        // The entityJoinTask will re-verify using live positions at execution time.
++        final int destChunkX = posChunk.x;
++        final int destChunkZ = posChunk.z;
 +        Runnable scheduleEntityJoin = () -> {
 +            io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue.queueTickTaskQueue(
 +                destination, destChunkX, destChunkZ, entityJoinTask[0]
