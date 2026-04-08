@@ -14588,6 +14588,8 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
 +        // We use the entity's live chunk position (matching what addEntity will check) and verify
 +        // ownership with getRegionAtSynchronised. If ownership fails, we re-queue to the correct chunk.
 +        final int[] requeueCount = new int[]{0};
++        final int destChunkX = posChunk.x;
++        final int destChunkZ = posChunk.z;
 +        final Runnable[] entityJoinTask = new Runnable[1];
 +
 +        entityJoinTask[0] = () -> {
@@ -14692,8 +14694,6 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
 +
 +        // Use the captured posChunk for initial task routing - this is correct at queue time.
 +        // The entityJoinTask will re-verify using live positions at execution time.
-+        final int destChunkX = posChunk.x;
-+        final int destChunkZ = posChunk.z;
 +        Runnable scheduleEntityJoin = () -> {
 +            io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue.queueTickTaskQueue(
 +                destination, destChunkX, destChunkZ, entityJoinTask[0]
