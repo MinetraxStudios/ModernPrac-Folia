@@ -26,23 +26,21 @@ jobs:
       - name: Apply Patches
         run: ./gradlew applyAllPatches --stacktrace
       - name: Build
-        run: ./gradlew createMojmapBundlerJar
+        run: ./gradlew createMojmapPaperclipJar
       - name: Get Minecraft Version
         id: mcver
         run: echo "mcversion=$(./gradlew -q printMinecraftVersion)" >> "$GITHUB_OUTPUT"
-      - name: Find Bundler Jar
+      - name: Find Paperclip Jar
         id: findjar
         run: |
-          JAR=$(find . -name "*.jar" -path "*/build/libs/*bundler*" | head -1)
+          JAR=$(find . -name "*paperclip*.jar" -path "*/build/libs/*" | head -1)
           echo "Found jar: $JAR"
-          DIR=$(dirname "$JAR")
-          echo "jardir=$DIR" >> "$GITHUB_OUTPUT"
           echo "jarpath=$JAR" >> "$GITHUB_OUTPUT"
       - name: Upload Artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: folia-server-jar
+          name: folia-paperclip
           path: ${{ steps.findjar.outputs.jarpath }}
       - name: Create Release
         if: success() && github.ref_name == github.event.repository.default_branch && github.event_name == 'push'
