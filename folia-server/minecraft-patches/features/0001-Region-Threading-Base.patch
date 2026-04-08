@@ -14371,7 +14371,7 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
          if (!this.level().paperConfig().scoreboards.allowNonPlayerEntitiesOnScoreboards && !(this instanceof Player)) { return null; } // Paper - Perf: Disable Scoreboards for non players by default
          return this.level().getScoreboard().getPlayersTeam(this.getScoreboardName());
      }
-@@ -3991,7 +4019,787 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+@@ -3991,7 +4019,820 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
          this.portalProcess = entity.portalProcess;
      }
  
@@ -14576,41 +14576,74 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
 +        final ServerLevel.PendingTeleport pendingTeleport = new ServerLevel.PendingTeleport(passengerTree, pos);
 +        destination.pushPendingTeleport(pendingTeleport);
 +
++        // Folia start - fix region ownership race in placeInAsync
++        // Region topology may change between task queuing and execution (splits/merges),
++        // causing the task to drain on a region that no longer owns the destination chunk.
++        // The thread check inside addEntity uses getRegionAtUnsynchronised which can see
++        // stale region mappings during concurrent splits. We use getRegionAtSynchronised
++        // (which acquires the regioniser read lock) to get a consistent view, and re-queue
++        // if the current region doesn't own the destination chunk.
++        final int destChunkX = posChunk.x;
++        final int destChunkZ = posChunk.z;
++        final int[] requeueCount = new int[]{0};
++        final Runnable[] entityJoinTask = new Runnable[1];
++
++        entityJoinTask[0] = () -> {
++            if (!destination.removePendingTeleport(pendingTeleport)) {
++                // shutdown logic placed the entity already, and we are shutting down
++                return;
++            }
++
++            // verify the executing region owns the destination chunk using a synchronized
++            // lookup to avoid stale reads from getRegionAtUnsynchronised during concurrent splits
++            final io.papermc.paper.threadedregions.ThreadedRegionizer.ThreadedRegion<io.papermc.paper.threadedregions.TickRegions.TickRegionData, io.papermc.paper.threadedregions.TickRegions.TickRegionSectionData>
++                currentRegion = io.papermc.paper.threadedregions.TickRegionScheduler.getCurrentRegion();
++            if (currentRegion != null && destination.regioniser.getRegionAtSynchronised(destChunkX, destChunkZ) != currentRegion) {
++                if (++requeueCount[0] > 16) {
++                    throw new IllegalStateException(
++                        "Cannot place entity at chunk [" + destChunkX + ", " + destChunkZ
++                        + "] in world '" + destination.getWorld().getKey()
++                        + "' after 16 attempts - region ownership unstable"
++                    );
++                }
++                // re-push so the next attempt's removePendingTeleport succeeds
++                destination.pushPendingTeleport(pendingTeleport);
++                io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue.queueTickTaskQueue(
++                    destination, destChunkX, destChunkZ, entityJoinTask[0]
++                );
++                return;
++            }
++
++            originWorld.moonrise$getChunkTaskScheduler().chunkHolderManager.removeTicketAtLevel(
++                TicketType.TELEPORT_HOLD_TICKET, posChunk,
++                ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager.MAX_TICKET_LEVEL,
++                teleportHoldId
++            );
++            List<EntityTreeNode> fullTree = passengerTree.getFullTree();
++            for (EntityTreeNode node : fullTree) {
++                node.root.placeSingleSync(originWorld, destination, node, teleportFlags);
++            }
++
++            // restore passenger tree
++            passengerTree.restore();
++            passengerTree.adjustRiders(true);
++
++            // invoke post dimension change now
++            for (EntityTreeNode node : fullTree) {
++                node.root.postChangeDimension();
++            }
++
++            if (teleportComplete != null) {
++                teleportComplete.accept(Entity.this);
++            }
++        };
++
 +        Runnable scheduleEntityJoin = () -> {
 +            io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue.queueTickTaskQueue(
-+                destination,
-+                ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkX(pos), ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkZ(pos),
-+                () -> {
-+                    if (!destination.removePendingTeleport(pendingTeleport)) {
-+                        // shutdown logic placed the entity already, and we are shutting down - do nothing to ensure
-+                        // we do not produce any errors here
-+                        return;
-+                    }
-+                    originWorld.moonrise$getChunkTaskScheduler().chunkHolderManager.removeTicketAtLevel(
-+                        TicketType.TELEPORT_HOLD_TICKET, posChunk,
-+                        ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager.MAX_TICKET_LEVEL,
-+                        teleportHoldId
-+                    );
-+                    List<EntityTreeNode> fullTree = passengerTree.getFullTree();
-+                    for (EntityTreeNode node : fullTree) {
-+                        node.root.placeSingleSync(originWorld, destination, node, teleportFlags);
-+                    }
-+
-+                    // restore passenger tree
-+                    passengerTree.restore();
-+                    passengerTree.adjustRiders(true);
-+
-+                    // invoke post dimension change now
-+                    for (EntityTreeNode node : fullTree) {
-+                        node.root.postChangeDimension();
-+                    }
-+
-+                    if (teleportComplete != null) {
-+                        teleportComplete.accept(Entity.this);
-+                    }
-+                }
++                destination, destChunkX, destChunkZ, entityJoinTask[0]
 +            );
 +        };
++        // Folia end - fix region ownership race in placeInAsync
 +
 +        if ((teleportFlags & TELEPORT_FLAG_LOAD_CHUNK) != 0L) {
 +            destination.loadChunksForMoveAsync(
@@ -15159,7 +15192,7 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
          // Paper start - Fix item duplication and teleport issues
          if ((!this.isAlive() || !this.valid) && (teleportTransition.newLevel() != this.level)) {
              LOGGER.warn("Illegal Entity Teleport {} to {}:{}", this, teleportTransition.newLevel(), teleportTransition.position(), new Throwable());
-@@ -4196,6 +5004,12 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+@@ -4196,6 +5037,12 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
          }
      }
  
@@ -15172,7 +15205,7 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
      protected void removeAfterChangingDimensions() {
          this.setRemoved(Entity.RemovalReason.CHANGED_DIMENSION, null); // CraftBukkit - add Bukkit remove cause
          if (this instanceof Leashable leashable && leashable.isLeashed()) { // Paper - only call if it is leashed
-@@ -4496,6 +5310,12 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+@@ -4496,6 +5343,12 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
      }
  
      public void startSeenByPlayer(ServerPlayer player) {
@@ -15185,7 +15218,7 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
      }
  
      public void stopSeenByPlayer(ServerPlayer player) {
-@@ -4505,6 +5325,12 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+@@ -4505,6 +5358,12 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
              new io.papermc.paper.event.player.PlayerUntrackEntityEvent(player.getBukkitEntity(), this.getBukkitEntity()).callEvent();
          }
          // Paper end - entity tracking events
@@ -15198,7 +15231,7 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
      }
  
      public float rotate(Rotation transformRotation) {
-@@ -5031,7 +5857,8 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+@@ -5031,7 +5890,8 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
              return;
          }
          // Paper end - Block invalid positions and bounding box
@@ -15208,7 +15241,7 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
              synchronized (this.posLock) { // Paper - detailed watchdog information
              this.position = new Vec3(x, y, z);
              } // Paper - detailed watchdog information
-@@ -5064,7 +5891,7 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+@@ -5064,7 +5924,7 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
          }
          // Paper start - Block invalid positions and bounding box; don't allow desync of pos and AABB
          // hanging has its own special logic
@@ -15217,7 +15250,7 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
              this.setBoundingBox(this.makeBoundingBox());
          }
          // Paper end - Block invalid positions and bounding box
-@@ -5170,6 +5997,12 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+@@ -5170,6 +6030,12 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
          return this.removalReason != null;
      }
  
@@ -15230,7 +15263,7 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
      public Entity.@Nullable RemovalReason getRemovalReason() {
          return this.removalReason;
      }
-@@ -5184,6 +6017,9 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+@@ -5184,6 +6050,9 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
          // Paper end - rewrite chunk system
          org.bukkit.craftbukkit.event.CraftEventFactory.callEntityRemoveEvent(this, cause); // CraftBukkit
          final boolean alreadyRemoved = this.removalReason != null; // Paper - Folia schedulers
@@ -15240,7 +15273,7 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
          if (this.removalReason == null) {
              this.removalReason = removalReason;
          }
-@@ -5207,6 +6043,10 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+@@ -5207,6 +6076,10 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
          this.removalReason = null;
      }
  
@@ -15251,7 +15284,7 @@ index 3bf618f1d756bad7755a87803132bd731e7c41be..a298b9babb6b42ff31781808821acd28
      // Paper start - Folia schedulers
      /**
       * Invoked only when the entity is truly removed from the server, never to be added to any world.
-@@ -5218,7 +6058,7 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+@@ -5218,7 +6091,7 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
      // Paper end - Folia schedulers
      // Paper start - optimise Folia entity scheduler
      public final void registerScheduler() {
