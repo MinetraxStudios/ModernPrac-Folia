@@ -25,11 +25,25 @@ jobs:
         run: git config --global user.email "actions@github.com" && git config --global user.name "Github Actions"
       - name: Apply Patches
         run: ./gradlew applyAllPatches --stacktrace
-      - name: Build
-        run: ./gradlew build
-      - name: Upload Server Jar
+      - name: Build Paperclip Jar
+        run: ./gradlew createMojmapPaperclipJar
+      - name: Get Minecraft Version
+        id: mcver
+        run: echo "mcversion=$(./gradlew -q printMinecraftVersion)" >> "$GITHUB_OUTPUT"
+      - name: Upload Artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: folia-server-jar
-          path: folia-server/build/libs/*.jar
+          name: folia-paperclip
+          path: build/libs/folia-paperclip-*-mojmap.jar
+      - name: Create Release
+        if: success() && github.ref_name == github.event.repository.default_branch && github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "Folia ${{ steps.mcver.outputs.mcversion }} #${{ github.run_number }}"
+          body: |
+            Folia build for Minecraft ${{ steps.mcver.outputs.mcversion }}
+            Commit: ${{ github.sha }}
+          files: build/libs/folia-paperclip-*-mojmap.jar
+          generate_release_notes: false
